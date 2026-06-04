@@ -2,7 +2,7 @@ name: AI Trader Bot
 
 on:
   schedule:
-    - cron: '*/5 13-21 * * 1-5'   # Every 5 min, Mon-Fri 13:00-21:00 UTC (market hours)
+    - cron: '*/5 * * * *'   # Every 5 min, 24/7
   workflow_dispatch:                # Allow manual runs
 
 jobs:
