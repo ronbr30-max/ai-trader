@@ -6615,6 +6615,18 @@ def main():
         return
 
     email=sys.argv[1]
+
+    # Optional --duration N (seconds) for cloud/CI runs
+    duration_limit=None
+    if "--duration" in sys.argv:
+        idx=sys.argv.index("--duration")
+        if idx+1<len(sys.argv):
+            try:
+                duration_limit=int(sys.argv[idx+1])
+            except ValueError:
+                pass
+    run_start=time.time()
+
     conn,cursor=connect_db()
     existing_start=get_session_start_time(
         cursor,
@@ -6663,7 +6675,9 @@ def main():
 
         last_scan_time=0
 
-        while should_continue(cursor,email):
+        while should_continue(cursor,email) and (
+            duration_limit is None or (time.time()-run_start)<duration_limit
+        ):
 
             if not current_worker_is_owner(cursor,email):
                 break

@@ -1,0 +1,45 @@
+name: AI Trader Bot
+
+on:
+  schedule:
+    - cron: '*/5 13-21 * * 1-5'   # Every 5 min, Mon-Fri 13:00-21:00 UTC (market hours)
+  workflow_dispatch:                # Allow manual runs
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore database
+        uses: actions/cache/restore@v4
+        with:
+          path: users.db
+          key: users-db-${{ github.run_id }}
+          restore-keys: |
+            users-db-
+
+      - name: Run trading bot (4 minutes)
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          BOT_EMAIL: ${{ secrets.BOT_EMAIL }}
+        run: python bot_worker.py "$BOT_EMAIL" --duration 240
+
+      - name: Save database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: users.db
+          key: users-db-${{ github.run_id }}
