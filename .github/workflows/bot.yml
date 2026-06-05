@@ -8,7 +8,7 @@ on:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: users.db
-          key: users-db-${{ github.run_id }}
+          key: users-db-latest
           restore-keys: |
             users-db-
 
@@ -42,4 +42,4 @@ jobs:
         if: always()
         with:
           path: users.db
-          key: users-db-${{ github.run_id }}
+          key: users-db-latest
