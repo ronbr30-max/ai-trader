@@ -93,8 +93,8 @@ POSITION_CHECK_SECONDS=5
 NEW_TRADE_SCAN_SECONDS=5
 PENDING_CONFIRM_SECONDS=10
 PENDING_MAX_AGE_SECONDS=90
-TAKE_PROFIT_PCT=0.003
-STOP_LOSS_PCT=0.0025
+TAKE_PROFIT_PCT=0.006
+STOP_LOSS_PCT=0.0015
 DIRECT_ORDER_POSITION_CASH=min(START_BALANCE*0.85,DIRECT_ORDER_RISK_DOLLARS/STOP_LOSS_PCT)
 DAILY_LOSS_LIMIT=750.0
 MIN_ENTRY_RSI=25
@@ -156,7 +156,7 @@ WATCHLISTS={
     ],
     "Crypto":[
         "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD",
-        "DOGE-USD","LINK-USD","AVAX-USD","LTC-USD","BCH-USD","DOT-USD",
+        "DOGE-USD","LINK-USD","AVAX-USD","LTC-USD","DOT-USD",
         "UNI-USD","AAVE-USD","SUI-USD","NEAR-USD","ARB-USD","OP-USD",
         "INJ-USD","RENDER-USD","FET-USD"
     ],
@@ -428,6 +428,33 @@ def connect_db():
     cursor.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_open_position_once
         ON open_positions_v2(email,ticker,direction)
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS adaptive_params(
+        email TEXT,
+        param TEXT,
+        value REAL,
+        reason TEXT,
+        changed_at TEXT,
+        PRIMARY KEY(email,param)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS adaptive_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT,
+        param TEXT,
+        old_value REAL,
+        new_value REAL,
+        reason TEXT,
+        win_rate REAL,
+        avg_win REAL,
+        avg_loss REAL,
+        total_trades INTEGER,
+        logged_at TEXT
+    )
     """)
 
     conn.commit()
@@ -6680,6 +6707,168 @@ def run_once(cursor,conn,email,scan_for_new=True,searching_enabled=True):
     )
 
 
+ADAPTIVE_PARAM_BOUNDS={
+    "TAKE_PROFIT_PCT":  (0.003, 0.015),
+    "STOP_LOSS_PCT":    (0.001, 0.004),
+    "MIN_LONG_ADJUSTED_SCORE": (4.0, 14.0),
+    "MIN_SHORT_ADJUSTED_SCORE": (6.0, 18.0),
+    "OPPORTUNITY_RESCUE_MIN_SCORE": (8.0, 25.0),
+}
+ADAPT_EVERY_N_TRADES=20
+ADAPT_LOOKBACK_TRADES=60
+
+
+def load_adaptive_params(cursor, email):
+    cursor.execute(
+        "SELECT param,value FROM adaptive_params WHERE email=?",
+        (email,)
+    )
+    params={}
+    for param,value in cursor.fetchall():
+        params[param]=value
+    return params
+
+
+def apply_adaptive_params(params):
+    global TAKE_PROFIT_PCT,STOP_LOSS_PCT
+    global MIN_LONG_ADJUSTED_SCORE,MIN_SHORT_ADJUSTED_SCORE
+    global OPPORTUNITY_RESCUE_MIN_SCORE
+    if "TAKE_PROFIT_PCT" in params:
+        TAKE_PROFIT_PCT=params["TAKE_PROFIT_PCT"]
+    if "STOP_LOSS_PCT" in params:
+        STOP_LOSS_PCT=params["STOP_LOSS_PCT"]
+    if "MIN_LONG_ADJUSTED_SCORE" in params:
+        MIN_LONG_ADJUSTED_SCORE=int(params["MIN_LONG_ADJUSTED_SCORE"])
+    if "MIN_SHORT_ADJUSTED_SCORE" in params:
+        MIN_SHORT_ADJUSTED_SCORE=int(params["MIN_SHORT_ADJUSTED_SCORE"])
+    if "OPPORTUNITY_RESCUE_MIN_SCORE" in params:
+        OPPORTUNITY_RESCUE_MIN_SCORE=int(params["OPPORTUNITY_RESCUE_MIN_SCORE"])
+
+
+def self_learn(cursor, conn, email):
+    now_str=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM trades WHERE email=?",
+        (email,)
+    )
+    total_trades=cursor.fetchone()[0]
+
+    if total_trades<ADAPT_EVERY_N_TRADES:
+        return
+
+    if total_trades % ADAPT_EVERY_N_TRADES != 0:
+        return
+
+    cursor.execute("""
+        SELECT profit FROM trades
+        WHERE email=?
+        ORDER BY id DESC
+        LIMIT ?
+    """,(email, ADAPT_LOOKBACK_TRADES))
+    recent=cursor.fetchall()
+
+    if len(recent)<10:
+        return
+
+    profits=[r[0] for r in recent]
+    wins=[p for p in profits if p>0]
+    losses=[p for p in profits if p<=0]
+    win_rate=len(wins)/len(profits)*100 if profits else 0
+    avg_win=sum(wins)/len(wins) if wins else 0
+    avg_loss=sum(losses)/len(losses) if losses else 0
+
+    def get_current(param):
+        cursor.execute(
+            "SELECT value FROM adaptive_params WHERE email=? AND param=?",
+            (email,param)
+        )
+        row=cursor.fetchone()
+        if row:
+            return row[0]
+        defaults={
+            "TAKE_PROFIT_PCT":TAKE_PROFIT_PCT,
+            "STOP_LOSS_PCT":STOP_LOSS_PCT,
+            "MIN_LONG_ADJUSTED_SCORE":float(MIN_LONG_ADJUSTED_SCORE),
+            "MIN_SHORT_ADJUSTED_SCORE":float(MIN_SHORT_ADJUSTED_SCORE),
+            "OPPORTUNITY_RESCUE_MIN_SCORE":float(OPPORTUNITY_RESCUE_MIN_SCORE),
+        }
+        return defaults.get(param,0)
+
+    def save_param(param, new_val, reason):
+        lo,hi=ADAPTIVE_PARAM_BOUNDS[param]
+        new_val=max(lo,min(hi,new_val))
+        old_val=get_current(param)
+        if abs(new_val-old_val)<1e-6:
+            return
+        cursor.execute("""
+            INSERT INTO adaptive_params(email,param,value,reason,changed_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(email,param) DO UPDATE SET
+                value=excluded.value,
+                reason=excluded.reason,
+                changed_at=excluded.changed_at
+        """,(email,param,new_val,reason,now_str))
+        cursor.execute("""
+            INSERT INTO adaptive_log(
+                email,param,old_value,new_value,reason,
+                win_rate,avg_win,avg_loss,total_trades,logged_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """,(
+            email,param,old_val,new_val,reason,
+            round(win_rate,1),round(avg_win,2),round(avg_loss,2),
+            total_trades,now_str
+        ))
+        conn.commit()
+
+    # Rule 1: win rate too low → tighten entry (raise min score)
+    if win_rate < 35:
+        cur=get_current("MIN_LONG_ADJUSTED_SCORE")
+        save_param(
+            "MIN_LONG_ADJUSTED_SCORE", cur+1,
+            f"Win rate {win_rate:.0f}% < 35%: raising entry bar to improve trade quality"
+        )
+
+    # Rule 2: win rate good but avg win < avg loss → widen TP
+    elif win_rate >= 45 and avg_win < abs(avg_loss)*0.8:
+        cur=get_current("TAKE_PROFIT_PCT")
+        save_param(
+            "TAKE_PROFIT_PCT", cur+0.001,
+            f"Win rate {win_rate:.0f}% OK but avg win ${avg_win:.2f} < avg loss ${abs(avg_loss):.2f}: widening TP"
+        )
+
+    # Rule 3: win rate very good → loosen entry to take more trades
+    elif win_rate >= 60:
+        cur=get_current("MIN_LONG_ADJUSTED_SCORE")
+        save_param(
+            "MIN_LONG_ADJUSTED_SCORE", cur-1,
+            f"Win rate {win_rate:.0f}% >= 60%: loosening entry to capture more opportunities"
+        )
+        cur2=get_current("OPPORTUNITY_RESCUE_MIN_SCORE")
+        save_param(
+            "OPPORTUNITY_RESCUE_MIN_SCORE", cur2-1,
+            f"Win rate {win_rate:.0f}% >= 60%: allowing lower-score setups into watch queue"
+        )
+
+    # Rule 4: losses too big relative to wins → tighten SL
+    if len(losses)>=5 and avg_loss!=0 and abs(avg_loss)>avg_win*2.5:
+        cur=get_current("STOP_LOSS_PCT")
+        save_param(
+            "STOP_LOSS_PCT", cur-0.0002,
+            f"Avg loss ${abs(avg_loss):.2f} is >2.5x avg win ${avg_win:.2f}: tightening stop loss"
+        )
+
+    # Rule 5: SL too tight causing many small losses with few wins → widen SL slightly
+    elif win_rate>=50 and avg_loss!=0 and abs(avg_loss)<avg_win*0.3:
+        cur=get_current("STOP_LOSS_PCT")
+        save_param(
+            "STOP_LOSS_PCT", cur+0.0001,
+            f"SL may be too tight: avg loss ${abs(avg_loss):.2f} << avg win ${avg_win:.2f}, giving trades more room"
+        )
+
+    apply_adaptive_params(load_adaptive_params(cursor, email))
+
+
 def main():
 
     if len(sys.argv)<2:
@@ -6717,6 +6906,9 @@ def main():
         conn,
         email
     )
+
+    # Load any self-learned parameters from previous sessions
+    apply_adaptive_params(load_adaptive_params(cursor, email))
 
     update_bot_state(
         cursor,
@@ -6771,6 +6963,8 @@ def main():
                 scan_for_new=scan_for_new,
                 searching_enabled=searching_enabled
             )
+
+            self_learn(cursor, conn, email)
 
             if scan_for_new:
 
