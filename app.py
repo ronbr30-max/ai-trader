@@ -10,8 +10,30 @@ import subprocess
 import sys
 from dotenv import load_dotenv
 import requests
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh=None
+
+try:
+    from trading_v2.repository import StrategyLabRepository
+except Exception:
+    StrategyLabRepository=None
 
 st.set_page_config(page_title="AI Trader", layout="wide")
+
+# Hide Streamlit toolbar (Stop/Deploy buttons)
+st.markdown("""
+<style>
+header[data-testid="stHeader"] { display: none !important; }
+#MainMenu { visibility: hidden !important; }
+footer { visibility: hidden !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Auto-refresh every 10 seconds
+if st_autorefresh is not None:
+    st_autorefresh(interval=10000, key="dashboard_refresh")
 
 # ---------------- SETTINGS ----------------
 
@@ -185,6 +207,25 @@ CREATE TABLE IF NOT EXISTS ai_lessons(
     lesson TEXT,
     active INTEGER DEFAULT 1
 )
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS evaluation_windows(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    planned_end_time TEXT NOT NULL,
+    end_time TEXT,
+    profit REAL DEFAULT 0,
+    trades INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'running',
+    note TEXT
+)
+""")
+
+cursor.execute("""
+CREATE INDEX IF NOT EXISTS idx_evaluation_windows_email
+ON evaluation_windows(email,start_time)
 """)
 
 cursor.execute("PRAGMA table_info(bot_state)")
@@ -927,23 +968,10 @@ def get_bot_state(email):
 
     if running and not is_process_alive(pid):
 
-        close_session_record(
-            email,
-            row[3] or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "worker stopped"
-        )
-
-        update_bot_state(
-            email,
-            False,
-            pid,
-            "AI is stopped. Previous worker is no longer running."
-        )
-
         return {
             "running":False,
             "pid":pid,
-            "status":"AI is stopped. Previous worker is no longer running.",
+            "status":"Always-on supervisor is restarting the worker.",
             "last_heartbeat":row[3],
             "best_ticker":row[4],
             "best_score":row[5],
@@ -964,6 +992,63 @@ def get_bot_state(email):
         "today_profit":float(row[7] or 0),
         "searching_enabled":bool(row[8]),
         "session_start_time":row[9]
+    }
+
+
+def get_current_evaluation_window(email):
+
+    cursor.execute("""
+        SELECT id,start_time,planned_end_time,end_time,profit,trades,status,note
+        FROM evaluation_windows
+        WHERE email=?
+        ORDER BY id DESC
+        LIMIT 1
+    """,(email,))
+
+    row=cursor.fetchone()
+
+    if not row:
+        return None
+
+    start_time=row[1]
+    planned_end=row[2]
+    end_time=row[3]
+    effective_end=end_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        SELECT COALESCE(SUM(profit),0),COUNT(*)
+        FROM trades
+        WHERE email=? AND time>=? AND time<=?
+    """,(
+        email,
+        start_time,
+        effective_end
+    ))
+
+    live_profit,live_trades=cursor.fetchone()
+
+    try:
+        start_dt=datetime.strptime(start_time,"%Y-%m-%d %H:%M:%S")
+        planned_end_dt=datetime.strptime(planned_end,"%Y-%m-%d %H:%M:%S")
+        elapsed_seconds=max(0,(datetime.now()-start_dt).total_seconds())
+        total_seconds=max(1,(planned_end_dt-start_dt).total_seconds())
+        progress=min(1.0,elapsed_seconds/total_seconds)
+        remaining=max(timedelta(0),planned_end_dt-datetime.now())
+    except Exception:
+        progress=0.0
+        remaining=timedelta(0)
+
+    return {
+        "id":row[0],
+        "start_time":start_time,
+        "planned_end_time":planned_end,
+        "end_time":end_time,
+        "profit":float(live_profit or row[4] or 0),
+        "trades":int(live_trades or row[5] or 0),
+        "status":row[6] or "unknown",
+        "note":row[7],
+        "progress":progress,
+        "remaining":str(remaining).split(".")[0]
     }
 
 
@@ -3204,86 +3289,110 @@ else:
         f"${st.session_state.profit:.2f}"
     )
 
-control_left,d=st.columns([7,3])
-
-if st.session_state.running:
-
-    st.caption(
-        f"AI is running in the background. Exits check every {POSITION_CHECK_SECONDS}s; new scans every {NEW_TRADE_SCAN_SECONDS}s."
-    )
-
-    state=get_bot_state(
-        st.session_state.user_email
-    ) if st.session_state.logged_in else {"searching_enabled":False}
-
-    stop_search_col,resume_search_col,stop_ai_col=d.columns(3)
-
-    if state["searching_enabled"]:
-
-        if stop_search_col.button("Pause Search"):
-
-            if st.session_state.logged_in:
-
-                set_searching_enabled(
-                    st.session_state.user_email,
-                    False
-                )
-
-                st.rerun()
-
-    else:
-
-        if resume_search_col.button("Resume Search",type="primary"):
-
-            if st.session_state.logged_in:
-
-                set_searching_enabled(
-                    st.session_state.user_email,
-                    True
-                )
-
-                st.rerun()
-
-    if stop_ai_col.button("STOP AI"):
-
-        if st.session_state.logged_in:
-
-            stop_background_ai(
-                st.session_state.user_email
-            )
-
-            save_user_summary()
-            st.rerun()
-
-else:
-
-    if d.button("\U0001F7E2 START AI",type="primary"):
-
-        if st.session_state.logged_in:
-
-            start_background_ai(
-                st.session_state.user_email
-            )
-
-            st.rerun()
-
-        else:
-
-            st.warning("Log in before starting the background AI.")
-
 if st.session_state.logged_in:
 
-    if st.button("Reset Trades Taken"):
+    st.caption(
+        "The trading worker is managed by the always-on supervisor. "
+        "This dashboard only displays data."
+    )
 
-        reset_trade_counter(
-            st.session_state.user_email
+    evaluation_window=get_current_evaluation_window(
+        st.session_state.user_email
+    )
+
+    if evaluation_window:
+
+        st.subheader("Current Evaluation Window")
+        w1,w2,w3,w4=st.columns(4)
+        w1.metric(
+            "Window P/L",
+            f"${evaluation_window['profit']:.2f}"
         )
+        w2.metric(
+            "Trades",
+            evaluation_window["trades"]
+        )
+        w3.metric(
+            "Status",
+            evaluation_window["status"].title()
+        )
+        w4.metric(
+            "Time Remaining",
+            evaluation_window["remaining"]
+        )
+        st.progress(
+            evaluation_window["progress"]
+        )
+        st.caption(
+            f"{evaluation_window['start_time']} -> "
+            f"{evaluation_window['planned_end_time']}"
+        )
+    else:
 
-        st.rerun()
+        st.info(
+            "The always-on supervisor has not created an evaluation window yet."
+        )
 
     render_live_ai_panel(
         st.session_state.user_email
     )
+
+    if StrategyLabRepository is not None:
+
+        with st.expander("Strategy V2 Lab"):
+
+            try:
+
+                strategy_lab=StrategyLabRepository()
+                latest_experiment=strategy_lab.latest_experiment()
+                latest_backtests=strategy_lab.latest_backtests()
+
+                st.caption(
+                    "5-minute entries, 15-minute confirmation, ATR/ADX risk controls, "
+                    "and champion/challenger backtesting. This lab does not change the "
+                    "current paper worker until a candidate is accepted."
+                )
+
+                if latest_experiment:
+
+                    e1,e2,e3=st.columns(3)
+                    e1.metric(
+                        "Last Candidate",
+                        latest_experiment["candidate_version"]
+                    )
+                    e2.metric(
+                        "Parameter",
+                        latest_experiment["parameter"]
+                    )
+                    e3.metric(
+                        "Decision",
+                        "Accepted" if latest_experiment["accepted"] else "Rejected"
+                    )
+
+                    st.write(
+                        f"{latest_experiment['old_value']} -> "
+                        f"{latest_experiment['new_value']} | "
+                        f"{latest_experiment['reason']}"
+                    )
+                else:
+
+                    st.info(
+                        "Version 2 is ready. No real historical experiment has been run yet."
+                    )
+
+                if latest_backtests:
+
+                    st.dataframe(
+                        pd.DataFrame(latest_backtests),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            except Exception as exc:
+
+                st.caption(
+                    f"Strategy lab is temporarily unavailable: {exc}"
+                )
 
 # ---------------- PERFORMANCE STATS ----------------
 

@@ -4,3 +4,5 @@ pandas
 plotly
 python-dotenv
 requests
+pywin32
+streamlit-autorefresh
