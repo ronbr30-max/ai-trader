@@ -2,13 +2,13 @@ name: AI Trader Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # Every 5 min, 24/7
-  workflow_dispatch:                # Allow manual runs
+    - cron: '0 * * * *'    # Every hour (GitHub throttles more frequent runs)
+  workflow_dispatch:         # Allow manual runs
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 58
 
     steps:
       - name: Checkout code
@@ -31,11 +31,11 @@ jobs:
           restore-keys: |
             users-db-
 
-      - name: Run trading bot (4 minutes)
+      - name: Run trading bot (55 minutes)
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           BOT_EMAIL: ${{ secrets.BOT_EMAIL }}
-        run: python bot_worker.py "$BOT_EMAIL" --duration 240
+        run: python bot_worker.py "$BOT_EMAIL" --duration 3300
 
       - name: Save database
         uses: actions/cache/save@v4
