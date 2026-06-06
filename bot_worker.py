@@ -629,6 +629,58 @@ def estimated_fees(entry,exit_price,qty,ticker=None):
     return traded_value*BROKER_FEE_PCT
 
 
+_news_cache={}
+_trend_15m_cache={}
+NEWS_CACHE_SECONDS=300
+TREND_15M_CACHE_SECONDS=300
+RECENT_NEWS_BLOCK_MINUTES=30
+
+
+def has_recent_news(symbol):
+    now_ts=time.time()
+    if symbol in _news_cache:
+        cache_ts,result=_news_cache[symbol]
+        if now_ts-cache_ts<NEWS_CACHE_SECONDS:
+            return result
+    try:
+        items=yf.Ticker(symbol).news or []
+        recent=any(
+            now_ts-n.get("providerPublishTime",0)<RECENT_NEWS_BLOCK_MINUTES*60
+            for n in items
+        )
+        _news_cache[symbol]=(now_ts,recent)
+        return recent
+    except Exception:
+        return False
+
+
+def get_15m_trend(symbol):
+    now_ts=time.time()
+    if symbol in _trend_15m_cache:
+        cache_ts,bullish,bearish=_trend_15m_cache[symbol]
+        if now_ts-cache_ts<TREND_15M_CACHE_SECONDS:
+            return bullish,bearish
+    try:
+        d=yf.download(
+            symbol,period="5d",interval="15m",
+            progress=False,auto_adjust=True
+        )
+        if not d.empty and len(d)>=20:
+            c=d["Close"].squeeze()
+            ema20=float(c.rolling(20).mean().iloc[-1])
+            last=float(c.iloc[-1])
+            bullish=last>ema20
+            bearish=last<ema20
+        else:
+            bullish=None
+            bearish=None
+    except Exception:
+        bullish=None
+        bearish=None
+    _trend_15m_cache[symbol]=(now_ts,bullish,bearish)
+    return bullish,bearish
+
+
 def scan(symbols):
 
     results=[]
@@ -636,6 +688,11 @@ def scan(symbols):
     for symbol in symbols:
 
         try:
+
+            if has_recent_news(symbol):
+                continue
+
+            trend_15m_bullish,trend_15m_bearish=get_15m_trend(symbol)
 
             data=yf.download(
                 symbol,
@@ -832,6 +889,13 @@ def scan(symbols):
             recent_range=float(high.tail(10).max())-float(low.tail(10).min())
             volatility=max(recent_range,price*0.0015)
 
+            if trend_15m_bullish is True:
+                score+=2
+                reasons.append("15m trend bullish")
+            elif trend_15m_bullish is False:
+                score-=2
+                reasons.append("15m trend bearish (against long)")
+
             results.append({
                 "Ticker":symbol,
                 "Price":round(price,2),
@@ -966,6 +1030,13 @@ def scan(symbols):
                 if trigger_avg_volume>0 and volume.iloc[-2]>trigger_avg_volume*1.3:
                     short_score+=2
                     short_reasons.append("trigger volume surge")
+
+            if trend_15m_bearish is True:
+                short_score+=2
+                short_reasons.append("15m trend bearish")
+            elif trend_15m_bearish is False:
+                short_score-=2
+                short_reasons.append("15m trend bullish (against short)")
 
             results.append({
                 "Ticker":symbol,
