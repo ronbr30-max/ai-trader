@@ -31,11 +31,11 @@ jobs:
           restore-keys: |
             users-db-
 
-      - name: Run trading bot (55 minutes)
+      - name: Run V2 trading bot (55 minutes)
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           BOT_EMAIL: ${{ secrets.BOT_EMAIL }}
-        run: python bot_worker.py "$BOT_EMAIL" --duration 3300
+        run: python bot_worker_v2.py "$BOT_EMAIL" --duration 3300
 
       - name: Save database
         uses: actions/cache/save@v4
