@@ -44,7 +44,75 @@ def connect_db():
     except sqlite3.OperationalError:
         pass
     cursor.execute("PRAGMA busy_timeout=30000")
+    ensure_tables(cursor,conn)
     return conn,cursor
+
+
+def ensure_tables(cursor,conn):
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        email TEXT PRIMARY KEY,
+        password TEXT,
+        balance REAL DEFAULT 50000,
+        profit REAL DEFAULT 0,
+        trades_taken INTEGER DEFAULT 0
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS bot_state(
+        email TEXT PRIMARY KEY,
+        running INTEGER DEFAULT 0,
+        pid INTEGER,
+        status TEXT,
+        last_heartbeat TEXT,
+        best_ticker TEXT,
+        best_score REAL,
+        open_positions_count INTEGER DEFAULT 0,
+        today_profit REAL DEFAULT 0,
+        session_start_time TEXT,
+        searching_enabled INTEGER DEFAULT 1
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS open_positions_v2(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT,
+        ticker TEXT,
+        entry REAL,
+        tp REAL,
+        sl REAL,
+        qty REAL,
+        entry_time TEXT,
+        market TEXT,
+        score REAL,
+        rsi REAL,
+        direction TEXT DEFAULT 'LONG',
+        entry_reason TEXT,
+        trigger_time TEXT,
+        trigger_high REAL,
+        trigger_close REAL
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS trades(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT,
+        time TEXT,
+        ticker TEXT,
+        entry REAL,
+        exit REAL,
+        profit REAL,
+        entry_time TEXT,
+        exit_time TEXT,
+        reason TEXT,
+        market TEXT,
+        score REAL,
+        rsi REAL,
+        direction TEXT DEFAULT 'LONG',
+        entry_reason TEXT
+    )
+    """)
+    conn.commit()
 
 
 def calculate_rsi(close,period=14):
